@@ -9,12 +9,23 @@
 #include <math.h>
 #include <inttypes.h>
 
-#include "serial.h" 
+#include "serial.h"
 #include "adc.h"
 #include "joystick.h"
 
 #define ROOT2 1.4142135623f
+#define MOVING_AVG_POINTS 30
 
+#define FULL_SPEED 512
+#define HALF_SPEED 448
+#define SLOW_SPEED 384
+#define STOP_SPEED 256
+
+#define SIGNIFICANT_READING_MM 300
+#define SIGNIFICANT_READING_MM_SIDE 200
+#define FRONT_CRITICAL_DIST 160
+#define SIDE_CRITICAL_DIST 80
+#define TOLERANCE 30
 // Distance from sensor to edge of robot in mm
 const int16_t CENTER_OFFSET = 87;
 const int16_t SIDE_OFFSET = 37;
@@ -25,7 +36,7 @@ ISR(TIMER1_COMPA_vect)
 	centiseconds_global += 1;
 }
 
-volatile bool interrupt0 = false;
+volatile bool interrupt0 = true;
 ISR(INT0_vect)
 {
 	static volatile uint32_t INT0_invalid_to = 0;
@@ -37,16 +48,25 @@ ISR(INT0_vect)
 	}
 }
 
+int16_t rolling_average(int16_t new_point, int64_t* prev_sum, int16_t* prev_index, size_t point_count, int16_t points[])
+{
+	*prev_sum -= points[*prev_index];
+	*prev_sum += new_point;
+	points[*prev_index] = new_point;
+	(*prev_index) = (*prev_index + 1) % point_count;
+	return *prev_sum / point_count;
+}
+
 int16_t front_to_mm(int16_t adc) { return -(53227500ll*adc-268558095607ll)/(2000*(2500ll*adc-78227)); }
 int16_t side_to_mm(int16_t adc)  { return -(61377500ll*adc - 110758264243ll)/(1250ll*(2500ll*adc+68970)); }
 
 int main(void)
 {
 
-///// BUTTON INTERRUPT ///////
-//	EICRA  |= (1<<ISC11);
-//	EICRA &= ~(1<<ISC10);
-//	EIMSK |= (1<<INT1);
+	///// BUTTON INTERRUPT ///////
+	//	EICRA  |= (1<<ISC11);
+	//	EICRA &= ~(1<<ISC10
+	//	EIMSK |= (1<<INT1);
 
 	EICRA  |= (1<<ISC01);
 	EICRA &= ~(1<<ISC00);
@@ -54,14 +74,14 @@ int main(void)
 	DDRD = 0b00;
 	PORTD = 0b11;
 	
-//////// CENTISECONDS SETUP /////////
+	//////// CENTISECONDS SETUP /////////
 	TCCR1A = 0x0;            // no output
 	TCCR1B |= 0b1101;         // CTC, 1024 prescaler
 	OCR1A = 16000000L/1024L/100; // When reached, 1cs has passed
 	// Clear timer on compare for Output Compare A Match Register (OCR1A)
 	TIMSK1 = (1<<OCIE1A);
 
-/////// PWM SETUP ////////////
+	/////// PWM SETUP ////////////
 	uint16_t pwm_period = 16000000UL / 1 / 10000 / 2;
 
 	// Configure timer3 to be in mode 10 (spread across TCCR3{A,B})
@@ -72,7 +92,7 @@ int main(void)
 	OCR3A = (uint16_t)pwm_period * 8 / 10; // Initially 80% duty cycle
 	OCR3B = (uint16_t)pwm_period * 2 / 3;  // Initially 66% duty cycle
 
-////////// MOTOR CONTROL PORT A SETUP //////////
+	////////// MOTOR CONTROL PORT A SETUP //////////
 	DDRA  = 0b00001111; // Set the motor control pins to output
 	PORTA = 0b00000101; // only 1 set at a time! (use setMotorDirection)
 
@@ -80,24 +100,50 @@ int main(void)
 	adc_init();
 	lcd_init();
 	serial0_init();
+
+	
 	
 	while(1)
 	{
 		char buffer[32];
-
 		// sensor readings
+		static int64_t l_prev_sum = 0, f_prev_sum = 0, r_prev_sum = 0;
+		static int16_t l_prev_i = 0, f_prev_i = 0, r_prev_i = 0;
+		static int16_t l_points[MOVING_AVG_POINTS], f_points[MOVING_AVG_POINTS], r_points[MOVING_AVG_POINTS];
+
+		static int16_t left_sensor	 = 0;
+		static int16_t front_sensor = 0;
+		static int16_t right_sensor = 0;
+
+		left_sensor  = side_to_mm(adc_read(4)) - SIDE_OFFSET;
+		front_sensor = front_to_mm(adc_read(5)) - CENTER_OFFSET;
+		right_sensor = side_to_mm(adc_read(6)) - SIDE_OFFSET;
+
+		static int64_t sensor_read_invalid_to = 0;
+		if(centiseconds_global > sensor_read_invalid_to)
+		{
+			left_sensor  = side_to_mm(adc_read(4)) - SIDE_OFFSET;
+			front_sensor = front_to_mm(adc_read(5)) - CENTER_OFFSET;
+			right_sensor = side_to_mm(adc_read(6)) - SIDE_OFFSET;
+
+			left_sensor  = rolling_average(left_sensor,  &l_prev_sum, &l_prev_i, MOVING_AVG_POINTS, l_points);
+			right_sensor = rolling_average(right_sensor, &r_prev_sum, &r_prev_i, MOVING_AVG_POINTS, r_points);
+			front_sensor = rolling_average(front_sensor, &f_prev_sum, &f_prev_i, MOVING_AVG_POINTS, f_points);
+			sensor_read_invalid_to = centiseconds_global;
+		}
 		
-		int16_t left_sensor = side_to_mm(adc_read(4)) - SIDE_OFFSET;
-		int16_t center_sensor = side_to_mm(adc_read(5)) - CENTER_OFFSET;
-		int16_t right_sensor = side_to_mm(adc_read(6)) - SIDE_OFFSET;
-
-		lcd_goto(0);
-		sprintf(buffer, "L:%4dmm R:%4dmm", left_sensor, right_sensor);
-		lcd_puts(buffer);
-		lcd_goto(0x40);
-		sprintf(buffer, "C: %6dmm", center_sensor);
-		lcd_puts(buffer);
-
+		static int64_t update_invalid_to = 0;
+		if(centiseconds_global > update_invalid_to) // update current state 4times a second
+		{
+			lcd_goto(0);
+			sprintf(buffer, "L:%4dmmR:%4dmm", left_sensor, right_sensor);
+			lcd_puts(buffer);
+			lcd_goto(0x40);
+			sprintf(buffer, "C: %6dmm", front_sensor);
+			lcd_puts(buffer);
+			update_invalid_to = centiseconds_global + 25;
+		}
+		
 		if(interrupt0) // manual mode
 		{
 			int16_t adc0 = adc_read(0) - (1024/2); // adc0 = [-512, 511]
@@ -121,61 +167,183 @@ int main(void)
 		}
 		else // autonomous mode
 		{
+			static enum sensor_states
+			{
+				OPEN_FORWARD = 0b000,
+				FOLLOW_LEFT = 0b100,
+				FOLLOW_RIGHT = 0b001,
+				APPROACH_FRONT = 0b010,
+				CAUTION_FRONT_LEFT = 0b110,
+				CAUTION_FRONT_RIGHT = 0b011,
+				CAUTION_LEFT_RIGHT = 0b101,
+				DEAD_END = 0b111
+			} current_state, old_state;
+			int16_t left_speed = FULL_SPEED;
+			int16_t right_speed = FULL_SPEED;
 
-			static enum state { 
-				FOLLOW_LEFT_WALL = 0, 
-				FOLLOW_RIGHT_WALL,
-				TURNING_LEFT,
-				TURNING_RIGHT,
-				STATIONARY,
-				REVERSING
-			} current_state = FOLLOW_LEFT_WALL;
-			int16_t left_motor_speed;
-			int16_t right_motor_speed;
-			static const int16_t WALL_DISTANCE = 15;
-
+			bool left_significant =   left_sensor < SIGNIFICANT_READING_MM_SIDE;
+			bool right_significant = right_sensor < SIGNIFICANT_READING_MM_SIDE;
+			bool front_significant = front_sensor < SIGNIFICANT_READING_MM;
+			static int64_t state_invalid_to = 0;
+			if(centiseconds_global > state_invalid_to) // update current state 4times a second
+			{
+				current_state = (left_significant << 2) | (front_significant << 1) | (right_significant << 0);
+				if(current_state != old_state)
+				{
+					switch(current_state)
+					{
+						case OPEN_FORWARD:
+						serial0_print_string("OPEN_FORWARD\n"); break;
+						case FOLLOW_LEFT:
+						serial0_print_string("FOLLOW_LEFT\n"); break;
+						case FOLLOW_RIGHT:
+						serial0_print_string("FOLLOW_RIGHT\n"); break;
+						case APPROACH_FRONT:
+						serial0_print_string("APPROACH_FRONT\n"); break;
+						case CAUTION_FRONT_LEFT:
+						serial0_print_string("CAUTION_FRONT_LEFT\n"); break;
+						case CAUTION_FRONT_RIGHT:
+						serial0_print_string("CAUTION_FRONT_RIGHT\n"); break;
+						case CAUTION_LEFT_RIGHT:
+						serial0_print_string("CAUTION_LEFT_RIGHT\n"); break;
+						case DEAD_END:
+						serial0_print_string("DEAD_END\n"); break;
+						default:
+						serial0_print_string("default\n"); break;
+					}
+				}
+				state_invalid_to = centiseconds_global + 25;
+			}
 			switch(current_state)
 			{
-				case FOLLOW_LEFT_WALL:
-						left_motor_speed = 512;
-						right_motor_speed =512;
-						static const int16_t WALL_DISTANCE = 100;
-						static const int16_t TOLERANCE = 30;
+				case OPEN_FORWARD:
+				left_speed = FULL_SPEED;
+				right_speed = FULL_SPEED;
+				break;
+				
+				case FOLLOW_LEFT:
+				left_speed  = FULL_SPEED;
+				right_speed = FULL_SPEED;
 
-						if(left_sensor < WALL_DISTANCE)
-							right_motor_speed /= (WALL_DISTANCE - left_sensor);
-						else if(left_sensor > WALL_DISTANCE + TOLERANCE)
-							left_motor_speed /= (left_sensor - WALL_DISTANCE - TOLERANCE);
+				if(left_sensor < SIDE_CRITICAL_DIST)
+					right_speed = STOP_SPEED;
+				else if(left_sensor > SIDE_CRITICAL_DIST + TOLERANCE)
+					left_speed = STOP_SPEED;
+				break;
+				
+				case FOLLOW_RIGHT:
+				left_speed  = FULL_SPEED;
+				right_speed = FULL_SPEED;
+				
+				if(right_sensor < SIDE_CRITICAL_DIST)
+					left_speed = STOP_SPEED;
+				else if(right_sensor > SIDE_CRITICAL_DIST + TOLERANCE)
+					right_speed = STOP_SPEED;
+				break;
+				
+				case APPROACH_FRONT:
+				if(front_sensor < FRONT_CRITICAL_DIST)
+				{
+					if(right_sensor > SIDE_CRITICAL_DIST * 3 && left_sensor > SIDE_CRITICAL_DIST * 3)
+					{
+						left_speed = STOP_SPEED;
+						right_speed = FULL_SPEED;
+					}
+					else
+					{
+						if(left_sensor>right_sensor + TOLERANCE)
+						{
+							left_speed = STOP_SPEED;
+							right_speed = FULL_SPEED;
+						}
+						else
+						{
+							left_speed = STOP_SPEED;
+							right_speed = FULL_SPEED;
+						}
+					}
+				}
+				else
+				{
+					left_speed  = HALF_SPEED;
+					right_speed = HALF_SPEED;
+				}
+				break;
+				
+				case CAUTION_FRONT_LEFT:
+				if(front_sensor < (FRONT_CRITICAL_DIST + TOLERANCE)  || left_sensor < (SIDE_CRITICAL_DIST + TOLERANCE))
+				{
+					left_speed  = FULL_SPEED;
+					right_speed = FULL_SPEED;
+					if(right_sensor < SIDE_CRITICAL_DIST)
+						left_speed = STOP_SPEED;
+					else if(right_sensor > SIDE_CRITICAL_DIST + TOLERANCE)
+						right_speed = STOP_SPEED;
+				}
+				else
+				{
+					//left_speed /= front_sensor < left_sensor ? front_sensor - FRONT_CRITICAL_DIST : left_sensor - FRONT_CRITICAL_DIST;
+					left_speed = FULL_SPEED;
+					right_speed = left_speed / 2;
+				}
+				break;
+				
+				case CAUTION_FRONT_RIGHT:
+				if(front_sensor < (FRONT_CRITICAL_DIST + TOLERANCE) || right_sensor < (SIDE_CRITICAL_DIST+TOLERANCE) )
+				{
+					left_speed  = FULL_SPEED;
+					right_speed = FULL_SPEED;
 
-						setMotorDirection(MOTOR1, false); // set motor direction to the sign of adc0
-						setMotorDirection(MOTOR2, false); // set motor direction to the sign of adc1
-						OCR3B = squish(left_motor_speed, 0.0f, 512.0f, 0.0f, pwm_period);
-						OCR3A = squish(right_motor_speed, 0.0f, 512.0f, 0.0f, pwm_period);
-
-						if(center_sensor < WALL_DISTANCE)
-							current_state = TURNING_RIGHT;
-
-					break;
-				case FOLLOW_RIGHT_WALL:
-					break;
-				case TURNING_LEFT:
-						
-					break;
-				case TURNING_RIGHT:
-						left_motor_speed = 512;
-						right_motor_speed = 0;
-
-						setMotorDirection(MOTOR1, false); // set motor direction to the sign of adc0
-						setMotorDirection(MOTOR2, false); // set motor direction to the sign of adc1
-						OCR3B = squish(left_motor_speed, 0.0f, 512.0f, 0.0f, pwm_period);
-						OCR3A = squish(right_motor_speed, 0.0f, 512.0f, 0.0f, pwm_period);
-						if(center_sensor > WALL_DISTANCE)
-							current_state = FOLLOW_LEFT_WALL;
-					break;
-
+					if(left_sensor < SIDE_CRITICAL_DIST)
+						right_speed = STOP_SPEED;
+					else if(left_sensor > SIDE_CRITICAL_DIST + TOLERANCE)
+						left_speed = STOP_SPEED;
+				}
+				else
+				{
+					//right_speed /= front_sensor < right_sensor ? front_sensor - FRONT_CRITICAL_DIST : right_sensor - FRONT_CRITICAL_DIST;
+					right_speed = FULL_SPEED;
+				}
+				left_speed = right_speed / 2;
+				break;
+				
+				case CAUTION_LEFT_RIGHT:
+				if(left_sensor > right_sensor + TOLERANCE)
+				{
+					left_speed = STOP_SPEED;
+					right_speed = FULL_SPEED;
+				}
+				else if (right_sensor > left_sensor + TOLERANCE)
+				{
+					right_speed = STOP_SPEED;
+					left_speed = FULL_SPEED;
+				}
+				else
+				{
+					left_speed = FULL_SPEED;
+					right_speed = FULL_SPEED;
+				}
+				break;
+				
+				case DEAD_END:
+				setMotorDirection(MOTOR1, true);
+				setMotorDirection(MOTOR2, true);
+				OCR3B = squish(left_speed, 0.0f, 512.0f, 0.0f, pwm_period);
+				OCR3A = squish(right_speed, 0.0f, 512.0f, 0.0f, pwm_period);
+				break;
 			}
-
+			setMotorDirection(MOTOR1, false);
+			setMotorDirection(MOTOR2, false);
+			OCR3B = squish(left_speed, 0.0f, 512.0f, 0.0f, pwm_period);
+			OCR3A = squish(right_speed, 0.0f, 512.0f, 0.0f, pwm_period);
+			static int64_t speed_invalid_to = 0;
+			old_state = current_state;
+			if(centiseconds_global > speed_invalid_to) // update current state 4times a second
+			{
+				sprintf(buffer, "l: %4d, r: %4d\n", left_speed, right_speed);
+				serial0_print_string(buffer);
+				speed_invalid_to = centiseconds_global + 25;
+			}
 		}
-
 	}
 }
