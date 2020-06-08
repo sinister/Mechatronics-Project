@@ -8,7 +8,7 @@
 #include "serial.h"
 
 #define SIGNIFICANT_READING_MM 300
-#define SIGNIFICANT_READING_MM_SIDE 200
+#define SIGNIFICANT_READING_MM_SIDE 300
 #define FRONT_CRITICAL_DIST 160
 #define SIDE_CRITICAL_DIST 80
 #define TOLERANCE 30
@@ -130,12 +130,43 @@ void autonomous_tick(int16_t left_sensor, int16_t front_sensor, int16_t right_se
 		
 		case CAUTION_FRONT_LEFT:
 			// There is something to the front and left, so we must be careful as we get closer
-			caution_front_left(&left_speed, &right_speed, left_sensor, front_sensor, right_sensor);
+//			caution_front_left(&left_speed, &right_speed, left_sensor, front_sensor, right_sensor);
+			if(front_sensor < (FRONT_CRITICAL_DIST + TOLERANCE)  || left_sensor < (SIDE_CRITICAL_DIST + TOLERANCE))
+			{
+				left_speed  = FULL_SPEED;
+				right_speed = FULL_SPEED;
+				if(right_sensor < SIDE_CRITICAL_DIST)
+					left_speed = STOP_SPEED;
+				else if(right_sensor > SIDE_CRITICAL_DIST + TOLERANCE)
+					right_speed = STOP_SPEED;
+			}
+			else
+			{
+				//left_speed /= front_sensor < left_sensor ? front_sensor - FRONT_CRITICAL_DIST : left_sensor - FRONT_CRITICAL_DIST;
+				left_speed = FULL_SPEED;
+				right_speed = left_speed / 2;
+			}
 			break;
 		
 		case CAUTION_FRONT_RIGHT:
 			// same as CAUTION_FRONT_LEFT, but reflected
-			caution_front_left(&right_speed, &left_speed, right_sensor, front_sensor, left_sensor);
+//			caution_front_left(&right_speed, &left_speed, right_sensor, front_sensor, left_sensor);
+			if(front_sensor < (FRONT_CRITICAL_DIST + TOLERANCE) || right_sensor < (SIDE_CRITICAL_DIST+TOLERANCE) )
+			{
+				left_speed  = FULL_SPEED;
+				right_speed = FULL_SPEED;
+
+				if(left_sensor < SIDE_CRITICAL_DIST)
+					right_speed = STOP_SPEED;
+				else if(left_sensor > SIDE_CRITICAL_DIST + TOLERANCE)
+					left_speed = STOP_SPEED;
+			}
+			else
+			{
+				//right_speed /= front_sensor < right_sensor ? front_sensor - FRONT_CRITICAL_DIST : right_sensor - FRONT_CRITICAL_DIST;
+				right_speed = FULL_SPEED;
+			}
+			left_speed = right_speed / 2;
 			break;
 		
 		case CAUTION_LEFT_RIGHT:
